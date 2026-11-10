@@ -1,0 +1,7 @@
+# Minimal runtime for Wasser1462 Qwen3-ASR ONNX inference.
+# CUDA: replace onnxruntime with onnxruntime-gpu.
+numpy
+onnxruntime>=1.18
+transformers>=4.57
+torch>=2.2
+scipy

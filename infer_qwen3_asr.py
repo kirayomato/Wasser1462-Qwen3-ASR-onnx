@@ -16,7 +16,10 @@ import scipy.signal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import transformers
 from transformers import AutoProcessor, AutoTokenizer
+
+_TF_MAJOR = int(transformers.__version__.split(".", 1)[0])
 
 
 def _feat_to_audio_tokens_len_np(
@@ -43,8 +46,40 @@ def _feat_to_audio_tokens_len_np(
 
 def _register_qwen3_asr() -> bool:
     try:
-        from qwen3_asr import Qwen3ASRConfig, Qwen3ASRProcessor
         from transformers import AutoConfig, AutoProcessor
+        from transformers.utils import generic as tf_generic
+
+        # Config and processor classes share a module with torch model classes
+        # that need this decorator at definition time; a no-op is enough here
+        # because only the config and processor are used for ONNX inference.
+        if not hasattr(tf_generic, "check_model_inputs"):
+            def _passthrough_decorator(*_args, **_kwargs):
+                return lambda fn: fn
+
+            tf_generic.check_model_inputs = _passthrough_decorator
+
+        from qwen3_asr import (
+            Qwen3ASRConfig,
+            Qwen3ASRProcessor,
+            Qwen3ASRTextConfig,
+        )
+
+        # Qwen's mrope fields are valid for this checkpoint but are absent from
+        # the default RoPE schema; declaring them keeps config validation quiet.
+        if _TF_MAJOR >= 5 and not getattr(
+            Qwen3ASRTextConfig, "_mrope_keys_declared", False
+        ):
+            _text_config_init = Qwen3ASRTextConfig.__init__
+
+            def _text_config_init_with_mrope(self, *args, **kwargs):
+                kwargs.setdefault(
+                    "ignore_keys_at_rope_validation",
+                    {"interleaved", "mrope_interleaved", "mrope_section"},
+                )
+                return _text_config_init(self, *args, **kwargs)
+
+            Qwen3ASRTextConfig.__init__ = _text_config_init_with_mrope
+            Qwen3ASRTextConfig._mrope_keys_declared = True
 
         AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
         AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
@@ -142,6 +177,18 @@ def _check_model_dir(model_dir: str) -> None:
         )
 
 
+def _drop_v4_tokenizer_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    # These tokenizer init kwargs are rejected by v5; filtering them up front
+    # keeps TypeError fallthrough from masking genuine load failures.
+    if _TF_MAJOR < 5:
+        return kwargs
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if k not in ("use_slow_tokenizer", "fix_mistral_regex")
+    }
+
+
 def _load_tokenizer(model_dir: str):
     for kwargs in (
         dict(
@@ -154,7 +201,9 @@ def _load_tokenizer(model_dir: str):
         dict(trust_remote_code=True),
     ):
         try:
-            return AutoTokenizer.from_pretrained(model_dir, **kwargs)
+            return AutoTokenizer.from_pretrained(
+                model_dir, **_drop_v4_tokenizer_kwargs(kwargs)
+            )
         except TypeError:
             continue
     return AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -166,7 +215,9 @@ def _load_processor(model_dir: str):
         dict(trust_remote_code=True),
     ):
         try:
-            return AutoProcessor.from_pretrained(model_dir, **kwargs)
+            return AutoProcessor.from_pretrained(
+                model_dir, **_drop_v4_tokenizer_kwargs(kwargs)
+            )
         except TypeError:
             continue
     return AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)

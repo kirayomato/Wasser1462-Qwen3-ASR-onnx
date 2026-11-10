@@ -16,7 +16,10 @@ import scipy.signal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import transformers
 from transformers import AutoProcessor, AutoTokenizer
+
+_TF_MAJOR = int(transformers.__version__.split(".", 1)[0])
 
 
 def _feat_to_audio_tokens_len_np(
@@ -43,8 +46,41 @@ def _feat_to_audio_tokens_len_np(
 
 def _register_qwen3_asr() -> bool:
     try:
-        from qwen3_asr import Qwen3ASRConfig, Qwen3ASRProcessor
         from transformers import AutoConfig, AutoProcessor
+        from transformers.utils import generic as tf_generic
+
+        # Config and processor classes share a module with torch model classes
+        # that need this decorator at definition time; a no-op is enough here
+        # because only the config and processor are used for ONNX inference.
+        if not hasattr(tf_generic, "check_model_inputs"):
+
+            def _passthrough_decorator(*_args, **_kwargs):
+                return lambda fn: fn
+
+            tf_generic.check_model_inputs = _passthrough_decorator
+
+        from qwen3_asr import (
+            Qwen3ASRConfig,
+            Qwen3ASRProcessor,
+            Qwen3ASRTextConfig,
+        )
+
+        # Qwen's mrope fields are valid for this checkpoint but are absent from
+        # the default RoPE schema; declaring them keeps config validation quiet.
+        if _TF_MAJOR >= 5 and not getattr(
+            Qwen3ASRTextConfig, "_mrope_keys_declared", False
+        ):
+            _text_config_init = Qwen3ASRTextConfig.__init__
+
+            def _text_config_init_with_mrope(self, *args, **kwargs):
+                kwargs.setdefault(
+                    "ignore_keys_at_rope_validation",
+                    {"interleaved", "mrope_interleaved", "mrope_section"},
+                )
+                return _text_config_init(self, *args, **kwargs)
+
+            Qwen3ASRTextConfig.__init__ = _text_config_init_with_mrope
+            Qwen3ASRTextConfig._mrope_keys_declared = True
 
         AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
         AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
@@ -142,6 +178,18 @@ def _check_model_dir(model_dir: str) -> None:
         )
 
 
+def _drop_v4_tokenizer_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    # These tokenizer init kwargs are rejected by v5; filtering them up front
+    # keeps TypeError fallthrough from masking genuine load failures.
+    if _TF_MAJOR < 5:
+        return kwargs
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if k not in ("use_slow_tokenizer", "fix_mistral_regex")
+    }
+
+
 def _load_tokenizer(model_dir: str):
     for kwargs in (
         dict(
@@ -154,7 +202,9 @@ def _load_tokenizer(model_dir: str):
         dict(trust_remote_code=True),
     ):
         try:
-            return AutoTokenizer.from_pretrained(model_dir, **kwargs)
+            return AutoTokenizer.from_pretrained(
+                model_dir, **_drop_v4_tokenizer_kwargs(kwargs)
+            )
         except TypeError:
             continue
     return AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -166,7 +216,9 @@ def _load_processor(model_dir: str):
         dict(trust_remote_code=True),
     ):
         try:
-            return AutoProcessor.from_pretrained(model_dir, **kwargs)
+            return AutoProcessor.from_pretrained(
+                model_dir, **_drop_v4_tokenizer_kwargs(kwargs)
+            )
         except TypeError:
             continue
     return AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
@@ -178,9 +230,7 @@ def _normalize_contexts(context_arg: Optional[List[str]], n: int) -> List[str]:
     if len(context_arg) == 1 and n > 1:
         return [context_arg[0] or ""] * n
     if len(context_arg) != n:
-        raise ValueError(
-            f"expected 1 or {n} --context values, got {len(context_arg)}"
-        )
+        raise ValueError(f"expected 1 or {n} --context values, got {len(context_arg)}")
     return [c or "" for c in context_arg]
 
 
@@ -191,13 +241,9 @@ def _build_messages(context: str) -> List[Dict[str, Any]]:
     ]
 
 
-def _build_text_prompt(
-    proc, context: str, force_language: Optional[str]
-) -> str:
+def _build_text_prompt(proc, context: str, force_language: Optional[str]) -> str:
     msgs = _build_messages(context)
-    base = proc.apply_chat_template(
-        msgs, add_generation_prompt=True, tokenize=False
-    )
+    base = proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
     if force_language:
         base = base + f"language {force_language}<asr_text>"
     return base
@@ -234,12 +280,8 @@ def _resolve_audio_token_and_id(tok, proc) -> Tuple[str, int]:
 
 
 def get_args():
-    p = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    p.add_argument(
-        "--model", type=str, required=True, help="Qwen3-ASR checkpoint path"
-    )
+    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--model", type=str, required=True, help="Qwen3-ASR checkpoint path")
     p.add_argument(
         "--conv_frontend",
         type=str,
@@ -364,8 +406,7 @@ def _infer_one(
     if max_samples <= 0:
         raise RuntimeError("empty audio after load")
     wavs_pad = [
-        np.pad(w, (0, max_samples - int(w.shape[0])), mode="constant")
-        for w in wavs
+        np.pad(w, (0, max_samples - int(w.shape[0])), mode="constant") for w in wavs
     ]
     total_audio_sec = sum(max(len(w) / 16000.0, 1e-6) for w in wavs)
 
@@ -410,9 +451,7 @@ def _infer_one(
 
     valid = feat_mask != 0
     feat_len_np = valid.sum(axis=1).astype(np.int64)
-    a_len = _feat_to_audio_tokens_len_np(
-        feat_len_np, chunk_size=args.chunk_size
-    )
+    a_len = _feat_to_audio_tokens_len_np(feat_len_np, chunk_size=args.chunk_size)
     A_conv = int(conv_output_np.shape[1])
     pos = np.arange(A_conv, dtype=np.int64).reshape(1, A_conv)
     tok_mask = pos < a_len.reshape(-1, 1)
@@ -435,21 +474,15 @@ def _infer_one(
     audio_features = np.asarray(audio_features, dtype=np.float32)
 
     if audio_features.ndim != 3:
-        raise RuntimeError(
-            f"unexpected audio_features shape: {audio_features.shape}"
-        )
+        raise RuntimeError(f"unexpected audio_features shape: {audio_features.shape}")
 
     B = int(audio_features.shape[0])
     if B != len(wav_paths):
-        raise RuntimeError(
-            f"batch size mismatch: wavs={len(wav_paths)}, encoder B={B}"
-        )
+        raise RuntimeError(f"batch size mismatch: wavs={len(wav_paths)}, encoder B={B}")
 
     a_uni = np.unique(a_len)
     if a_uni.size != 1:
-        raise RuntimeError(
-            "equal-length batch required; a_len=" + str(a_len.tolist())
-        )
+        raise RuntimeError("equal-length batch required; a_len=" + str(a_len.tolist()))
     A = int(a_uni[0])
     if A <= 0:
         raise RuntimeError(f"invalid audio token length: {A}")
@@ -469,9 +502,7 @@ def _infer_one(
 
     slots = (input_ids == audio_token_id).sum(axis=1)
     if not np.all(slots == A):
-        raise RuntimeError(
-            f"audio slot mismatch: slots={slots.tolist()} A={A}"
-        )
+        raise RuntimeError(f"audio slot mismatch: slots={slots.tolist()} A={A}")
 
     L, model_max_total_len, kv, hd = _infer_cache_meta(dec)
     if kv is None or hd is None:
@@ -499,12 +530,8 @@ def _infer_one(
 
     caches: List[np.ndarray] = []
     for _ in range(L):
-        caches.append(
-            np.zeros((B, runtime_max_total_len, kv, hd), dtype=np.float32)
-        )
-        caches.append(
-            np.zeros((B, runtime_max_total_len, kv, hd), dtype=np.float32)
-        )
+        caches.append(np.zeros((B, runtime_max_total_len, kv, hd), dtype=np.float32))
+        caches.append(np.zeros((B, runtime_max_total_len, kv, hd), dtype=np.float32))
 
     dec_out_names = [o.name for o in dec.get_outputs()]
     if "logits" not in dec_out_names:
@@ -518,9 +545,7 @@ def _infer_one(
         Sb = int(step_input_ids.shape[0])
         S = int(step_input_ids.shape[1])
         if Sb != B:
-            raise RuntimeError(
-                f"step_input_ids batch {Sb} != B {B}"
-            )
+            raise RuntimeError(f"step_input_ids batch {Sb} != B {B}")
         if cur_len + S > runtime_max_total_len:
             raise RuntimeError(
                 f"cur_len overflow: {cur_len}+{S} > {runtime_max_total_len}"
@@ -582,9 +607,7 @@ def _infer_one(
         try:
             return _run_batched()
         except Exception:
-            return np.concatenate(
-                [_run_one(bi) for bi in range(B)], axis=0
-            )
+            return np.concatenate([_run_one(bi) for bi in range(B)], axis=0)
 
     cur_len = 0
     logits = _run_decoder(input_ids, cur_len, prompt_attn)
@@ -610,9 +633,7 @@ def _infer_one(
             if active[b]:
                 step_ids[b, 0] = out_rows[b][-1]
             else:
-                step_ids[b, 0] = (
-                    int(eos_id) if eos_id is not None else out_rows[b][-1]
-                )
+                step_ids[b, 0] = int(eos_id) if eos_id is not None else out_rows[b][-1]
         logits = _run_decoder(step_ids, cur_len, None)
         cur_len += 1
         next_ids = np.argmax(logits[:, -1, :], axis=-1).astype(np.int64)

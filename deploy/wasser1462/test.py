@@ -3,7 +3,7 @@ import librosa
 
 model = Qwen3ASRModel(
     model_id=r"D:\Program\Github\Qwen3-ASR-onnx\model",
-    model_dir=r"D:\Program\Github\Qwen3-ASR-onnx\Qwen3-ASR-0.6B",
+    model_dir=r"D:\Program\Github\Qwen3-ASR-onnx\Qwen3-ASR-0.6B-meta",
     context="微积分 微分几何 导数",
     language="Chinese",
 )
